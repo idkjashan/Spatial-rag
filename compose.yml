@@ -1,0 +1,89 @@
+name: spatialrag-stack
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: spatialrag_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spatialrag_network
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: spatialrag_qdrant
+    ports:
+      - "${QDRANT_PORT}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - spatialrag_network
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: spatialrag_neo4j
+    environment:
+      NEO4J_AUTH: "${NEO4J_USER}/${NEO4J_PASSWORD}"
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
+    ports:
+      - "${NEO4J_HTTP_PORT}:7474"
+      - "${NEO4J_BOLT_PORT}:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "${NEO4J_USER}", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spatialrag_network
+
+  app:
+    build: .
+    container_name: spatialrag_app
+    ports:
+      - "${APP_PORT}:8000"
+    environment:
+      - META_DB_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - GRAPH_DB_URL=bolt://${NEO4J_USER}:${NEO4J_PASSWORD}@neo4j:7687
+      - VECTOR_DB_URL=http://qdrant:6333
+      - IMAGE_CACHE_PATH=${IMAGE_CACHE_PATH}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - .:/app
+      - /app/.venv
+    networks:
+      - spatialrag_network
+    command: >
+      sh -c "
+      echo 'Gating: Waiting for Qdrant port 6333...';
+      until python3 -c 'import socket; socket.create_connection((\"qdrant\", 6333), timeout=1)' 2>/dev/null; do sleep 1; done;
+      echo 'Qdrant socket cleared! Launching SpatialRAG API...';
+      uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  neo4j_data:
+
+networks:
+  spatialrag_network:
+    driver: bridge
