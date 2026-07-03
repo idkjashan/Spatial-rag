@@ -49,3 +49,8 @@ class Edge(SpatialRAGBase):
 
     edge_meta: Dict[str, Any] = Field(default_factory=dict)
     evidence: Optional[str] = None
+
+    embedding_refs: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Map of model_name to Qdrant point ID for the edge's evidence text"
+    )

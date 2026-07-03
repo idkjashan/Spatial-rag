@@ -56,7 +56,9 @@ services:
       - "${APP_PORT}:8000"
     environment:
       - META_DB_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - GRAPH_DB_URL=bolt://${NEO4J_USER}:${NEO4J_PASSWORD}@neo4j:7687
+      - GRAPH_DB_URL=bolt://neo4j:7687
+      - GRAPH_DB_USER=${NEO4J_USER}
+      - GRAPH_DB_PASSWORD=${NEO4J_PASSWORD}
       - VECTOR_DB_URL=http://qdrant:6333
       - IMAGE_CACHE_PATH=${IMAGE_CACHE_PATH}
     depends_on:
