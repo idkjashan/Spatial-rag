@@ -12,6 +12,7 @@ class EdgeCategory(str, Enum):
     CAPTION = "caption"
     REFERENCE = "reference"
     DEFINITION = "definition"
+    LIST_HIERARCHY = "list_hierarchy"
     TABLE_HIERARCHY = "table_hierarchy"
     TABLE_SEMANTICS = "table_semantics"
     TABLE_AGGREGATION = "table_aggregation"

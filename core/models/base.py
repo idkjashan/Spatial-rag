@@ -12,7 +12,8 @@ class SpatialRAGBase(BaseModel):
     model_config = ConfigDict(
         frozen=False,
         validate_assignment=True,
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed=True,
+        protected_namespaces=()
     )
 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique UUID")
