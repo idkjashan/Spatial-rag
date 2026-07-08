@@ -47,8 +47,10 @@ class DoclingMapper:
         self.edges: List[Edge] = []
         self.seq_idx = 0
         self.heading_stack = []
-        # Map: page_no -> (width, height, dpi)
         self.page_dims_map: Dict[int, Tuple[float, float, float]] = {}
+        
+        # FIX: Track deferred captions to inject text after all nodes are processed
+        self.deferred_captions: Dict[str, List[str]] = {}
 
     def _safe_get_attr(self, obj: Any, attr_path: str, default: Any = None) -> Any:
         attrs = attr_path.split('.')
@@ -70,25 +72,21 @@ class DoclingMapper:
         return self.id_map[ref_str]
 
     def _extract_bbox(self, item) -> Optional[BoundingBox]:
-        """Robustly extracts, normalizes, and sanitizes bounding boxes."""
         bbox_data = None
         page_no = 1
         confidence = 1.0
         
-        # 1. Try provenance (most common for text)
         if hasattr(item, 'prov') and item.prov:
             prov = item.prov[0]
             bbox_data = getattr(prov, 'bbox', None)
             page_no = getattr(prov, 'page_no', 1)
-            confidence = getattr(prov, 'confidence', 1.0) # Confidence often lives on prov
+            confidence = getattr(prov, 'confidence', 1.0)
             
-        # 2. Fallback to direct bbox attribute (common for pictures)
         if not bbox_data and hasattr(item, 'bbox'):
             bbox_data = item.bbox
             page_no = getattr(item, 'page_no', 1)
             confidence = getattr(item, 'confidence', confidence)
             
-        # 3. Fallback for tables (grid bbox)
         if not bbox_data and hasattr(item, 'data') and hasattr(item.data, 'grid') and hasattr(item.data.grid, 'bbox'):
             bbox_data = item.data.grid.bbox
             page_no = getattr(item, 'page_no', 1)
@@ -100,46 +98,34 @@ class DoclingMapper:
             r = float(getattr(bbox_data, 'r', 0.0))
             b = float(getattr(bbox_data, 'b', 0.0))
             
-            # FIX: Ensure proper left/right and top/bottom ordering
-            # Sometimes Docling returns coords where l > r or t > b depending on origin.
             l, r = min(l, r), max(l, r)
             t, b = min(t, b), max(t, b)
             
             page_w, page_h, dpi = self.page_dims_map.get(page_no, (0.0, 0.0, 72.0))
             
             if page_w > 0 and page_h > 0:
-                # Normalize to 0.0-1.0 percentages
                 x = l / page_w
                 y = t / page_h
                 w = (r - l) / page_w
                 h = (b - t) / page_h
-                
-                # FIX: Clamp values strictly to [0.0, 1.0] to prevent spatial index errors
                 x = max(0.0, min(1.0, x))
                 y = max(0.0, min(1.0, y))
                 w = max(0.0, min(1.0 - x, w))
                 h = max(0.0, min(1.0 - y, h))
             else:
-                # Fallback to absolute if dimensions missing (should ideally not happen)
                 x, y = l, t
                 w, h = r - l, b - t
             
-            # FIX: Enforce minimum size to prevent zero-area geometries 
-            # (breaks R-Tree/KD-Tree spatial queries later)
             min_dim = 0.001
             if w < min_dim: w = min_dim
             if h < min_dim: h = min_dim
                 
-            return BoundingBox(
-                x=x, y=y, w=w, h=h, 
-                page=int(page_no) - 1, 
-                confidence=float(confidence), 
-                dpi=float(dpi)
-            )
+            return BoundingBox(x=x, y=y, w=w, h=h, page=int(page_no) - 1, confidence=float(confidence), dpi=float(dpi))
         return None
 
     def _extract_ref_number(self, text: str) -> Optional[str]:
-        match = re.search(r'(?:Figure|Fig\.|Table|Tab\.)\s*(\d+)', text, re.IGNORECASE)
+        # FIX: Updated regex to capture floats like 1.2
+        match = re.search(r'(?:Figure|Fig\.|Table|Tab\.|Equation|Eq\.|Section|Sec\.)\s*(\d+(?:\.\d+)*)', text, re.IGNORECASE)
         return match.group(1) if match else None
 
     def _get_hierarchy_parent(self, page_no: int, page_nodes_map: Dict) -> str:
@@ -222,6 +208,9 @@ class DoclingMapper:
                 elif item.label == "picture":
                     self._process_picture_item(item, page_nodes_map)
 
+        # FIX: Inject deferred captions now that all text nodes have been processed
+        self._inject_deferred_captions()
+        
         self._generate_read_order_edges()
         return self.nodes, self.edges
 
@@ -232,15 +221,11 @@ class DoclingMapper:
                 w = float(self._safe_get_attr(page, 'size.width', 0.0))
                 h = float(self._safe_get_attr(page, 'size.height', 0.0))
                 
-                # Fallback to page bbox if size is missing
                 if (w == 0.0 or h == 0.0) and hasattr(page, 'bbox') and page.bbox:
                     w = float(getattr(page.bbox, 'r', 0.0)) - float(getattr(page.bbox, 'l', 0.0))
                     h = float(getattr(page.bbox, 'b', 0.0)) - float(getattr(page.bbox, 't', 0.0))
                 
-                # Attempt to get DPI, default to 72.0
                 dpi = float(self._safe_get_attr(page, 'dpi', 72.0))
-                
-                # Store dims for normalization later
                 self.page_dims_map[page_no] = (w, h, dpi)
                 
                 page_id = str(uuid.uuid4())
@@ -264,9 +249,7 @@ class DoclingMapper:
         node_id = self.get_or_create_id(item.self_ref)
         node_meta, edge_meta = {}, {}
 
-        # FIX: Safe cast to string
         text_content = str(item.text) if item.text else ""
-
         is_container = config.get("is_container", False)
         
         if is_container:
@@ -317,7 +300,8 @@ class DoclingMapper:
         parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
         
         image_path = os.path.join(self.image_cache_path, f"{node_id}.png")
-        node = self._create_node(item.self_ref, "figure", ModalityCategory.IMAGE, "", bbox, parent_id, None, "member", image_path)
+        # Give image a default content so it's not strictly empty if no caption exists
+        node = self._create_node(item.self_ref, "figure", ModalityCategory.IMAGE, "Figure image.", bbox, parent_id, None, "member", image_path)
         self.image_ref_map[item.self_ref] = node
         self._create_edge(parent_id, node_id, "element_to_element")
         
@@ -333,19 +317,37 @@ class DoclingMapper:
         captions = getattr(item, 'captions', [])
         for cap_ref in captions:
             cap_ref_str = self._get_ref_string(cap_ref)
-            if cap_ref_str in self.id_map:
-                cap_node_id = self.id_map[cap_ref_str]
-                cap_text = self.node_text_map.get(cap_node_id, "")
-                ref_num = self._extract_ref_number(cap_text)
-                
-                meta = {"ref_type": ref_type}
-                if ref_num: meta["number"] = ref_num
-                self._create_edge(source_node_id, cap_node_id, "element_to_caption", meta)
-                
-                source_node = next((n for n in self.nodes if n.id == source_node_id), None)
-                if source_node and cap_text:
-                    source_node.content += f"\n\n[CAPTION]: {cap_text}" if source_node.content else f"[CAPTION]: {cap_text}"
-                    self.node_text_map[source_node_id] = source_node.content
+            # FIX: Pre-allocate ID so the edge can be created immediately,
+            # even if the caption text node hasn't been processed yet.
+            cap_node_id = self.get_or_create_id(cap_ref_str)
+            
+            self._create_edge(source_node_id, cap_node_id, "element_to_caption", {"ref_type": ref_type})
+            
+            if source_node_id not in self.deferred_captions:
+                self.deferred_captions[source_node_id] = []
+            self.deferred_captions[source_node_id].append(cap_node_id)
+
+    def _inject_deferred_captions(self):
+        """Injects caption text and reference numbers into image/table nodes after all nodes exist."""
+        for source_id, cap_ids in self.deferred_captions.items():
+            source_node = next((n for n in self.nodes if n.id == source_id), None)
+            if not source_node: continue
+            
+            for cap_id in cap_ids:
+                cap_text = self.node_text_map.get(cap_id, "")
+                if cap_text:
+                    # Inject into source content
+                    if "[CAPTION]:" not in source_node.content:
+                        source_node.content += f"\n\n[CAPTION]: {cap_text}"
+                        self.node_text_map[source_id] = source_node.content
+                    
+                    # Update edge meta with number
+                    ref_num = self._extract_ref_number(cap_text)
+                    if ref_num:
+                        for e in self.edges:
+                            if e.source_id == source_id and e.target_id == cap_id and e.type == "captioned_by":
+                                e.edge_meta["number"] = ref_num
+                                break
 
     def _generate_read_order_edges(self):
         allowed_categories = [

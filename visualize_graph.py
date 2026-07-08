@@ -35,7 +35,13 @@ class DoclingGraphVisualizer:
         "contains": "grey",
         "captioned_by": "red",
         "read_order_next": "blue",
-        "default": "grey"
+        "default": "grey",
+        "adjacent_to":"green",
+        "left_of":"yellow",
+        "right_of":"yellow",
+        "above":"yellow",
+        "below":"yellow",
+        "references":"pink"
     }
 
     def __init__(self, json_path: Optional[str] = None,
@@ -127,7 +133,7 @@ class DoclingGraphVisualizer:
 
         color = self._get_edge_color(edge)
         edge_id = edge.get('id')
-        line_kw = dict(color=color, linewidth=2.5, alpha=0.8, gid=edge_id)
+        line_kw = dict(color=color, linewidth=1.5, alpha=0.8, gid=edge_id)
 
         if draw_arrow and edge.get('type') == 'read_order_next':
             # Draw arrow with picker support
@@ -151,7 +157,7 @@ class DoclingGraphVisualizer:
         # Clickable circle at midpoint
         mx = (sx + tx) / 2
         my = (sy + ty) / 2
-        circle = Circle((mx, my), radius=5,
+        circle = Circle((mx, my), radius=3,
                         facecolor=color, edgecolor='black', alpha=0.9,
                         gid=edge_id, picker=True)
         ax.add_patch(circle)
@@ -305,8 +311,8 @@ class DoclingGraphVisualizer:
 
 
 if __name__ == "__main__":
-    viz = DoclingGraphVisualizer(json_path="parser_output_full.json")
-    viz.draw(page_num=1, mode='interactive', show_read_order_arrows=True,
+    viz = DoclingGraphVisualizer(json_path="enriched_output_full.json")
+    viz.draw(page_num=6, mode='interactive', show_read_order_arrows=True,
              show_cross_badge=True, show_sequence_numbers=False)
     # Batch: save all pages as a static PNG (no interactivity)
-    #viz.draw(mode='save_all', output_path="all_pages_static.png", dpi=150)
+    viz.draw(mode='save_all', output_path="all_pages_static.png", dpi=150)
