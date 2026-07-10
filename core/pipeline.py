@@ -3,7 +3,7 @@ import logging
 from core.stores.manager import StorageManager
 from core.models.document import Document, DocStatus
 from core.models.processor import ProcessorManifest, ProcessorCapability
-from core.embeddings.service import EmbeddingService
+from core.embeddings.graph_embedder import EmbeddingService
 from core.config import EngineConfig
 
 logger = logging.getLogger(__name__)

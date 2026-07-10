@@ -9,7 +9,7 @@ from core.models.document import Document
 from core.stores.postgres import PostgresClient
 from core.stores.neo4j import Neo4jClient
 from core.stores.qdrant import QdrantClient
-from core.embeddings.service import EmbeddingService
+from core.embeddings.graph_embedder import EmbeddingService
 from core.config import EngineConfig
 
 logger = logging.getLogger(__name__)
