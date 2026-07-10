@@ -1,11 +1,13 @@
 import sys
 import os
 import json
-from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 from collections import defaultdict
 
 from core.parsers.docling_parser import DoclingParser
-from core.processors.post_processor import GraphPostProcessor  # Added Post-Processor
+from core.processors.post_processor import GraphPostProcessor
+from core.processors.contextual_enricher import ContextualEnricher  # Added Phase 2 Enricher
 from core.models.node import Node, ModalityCategory
 from core.models.edge import Edge, EdgeCategory
 
@@ -37,7 +39,6 @@ def build_adjacency(edges, direction='outgoing', category_filter=None):
 def print_hierarchy(nodes, edges, doc_id, max_depth=5):
     """Print document hierarchy as a tree (Strictly HIERARCHY edges only)."""
     node_map = build_node_map(nodes)
-    # Filter for HIERARCHY only so spatial/reference edges don't ruin the tree
     adj = build_adjacency(edges, 'outgoing', category_filter=EdgeCategory.HIERARCHY)
     
     root_id = doc_id
@@ -75,14 +76,12 @@ def print_post_processing_stats(nodes, edges, node_map):
     """Prints stats specifically for Phase 0.75 enrichments."""
     print("\n🛠️ Post-Processing Verification:")
     
-    # 1. Context Augmentation Check
     augmented_count = sum(1 for n in nodes if ">" in n.content and n.modality_category in [ModalityCategory.TEXTUAL_CONTENT, ModalityCategory.TABLE_CONTAINER])
     print(f"   Nodes with Context Path Prefix: {augmented_count}")
     if augmented_count > 0:
         sample = next(n for n in nodes if ">" in n.content and n.modality_category == ModalityCategory.TEXTUAL_CONTENT)
         print(f"   Sample Context: {sample.content[:100]}...")
 
-    # 2. Spatial Relations Check
     spatial_edges = [e for e in edges if e.type_category == EdgeCategory.SPATIAL_RELATION]
     print(f"\n   Spatial Edges Created: {len(spatial_edges)}")
     for e in spatial_edges[:3]:
@@ -90,7 +89,6 @@ def print_post_processing_stats(nodes, edges, node_map):
         tgt = node_map.get(e.target_id)
         print(f"   - {src.modality} -> {e.type} -> {tgt.modality}")
 
-    # 3. Cross-References Check
     ref_edges = [e for e in edges if e.type_category == EdgeCategory.REFERENCE]
     print(f"\n   Reference Edges Created: {len(ref_edges)}")
     for e in ref_edges[:3]:
@@ -98,13 +96,34 @@ def print_post_processing_stats(nodes, edges, node_map):
         tgt = node_map.get(e.target_id)
         print(f"   - Text({src.id[:8]}) -> references -> {tgt.modality} (Matched: {e.edge_meta.get('matched_text', 'N/A')})")
 
-    # 4. Evidence Generation Check
     evidenced_edges = [e for e in edges if e.evidence]
     print(f"\n   Edges with Evidence String: {len(evidenced_edges)} / {len(edges)}")
     if evidenced_edges:
         print("   Sample Evidence Strings:")
         for e in evidenced_edges[:3]:
             print(f"   - [{e.type}]: {e.evidence}")
+
+def print_llm_enrichment_stats(nodes):
+    """Prints stats specifically for Phase 2 LLM/VLM enrichments."""
+    print("\n🧠 Phase 2 Contextual Enrichment Verification:")
+    
+    vlm_count = sum(1 for n in nodes if "[VLM_SUMMARY]" in n.content)
+    slm_table_count = sum(1 for n in nodes if "[SLM_SUMMARY]" in n.content and n.modality_category == ModalityCategory.TABLE_CONTAINER)
+    slm_list_count = sum(1 for n in nodes if "[SLM_SUMMARY]" in n.content and n.modality_category == ModalityCategory.DOCUMENT_STRUCTURE and n.modality == "list")
+    slm_formula_count = sum(1 for n in nodes if "[SLM_EXPLANATION]" in n.content)
+    
+    print(f"   VLM Image Summaries Added: {vlm_count}")
+    print(f"   SLM Table Summaries Added: {slm_table_count}")
+    print(f"   SLM List Summaries Added: {slm_list_count}")
+    print(f"   SLM Formula Explanations Added: {slm_formula_count}")
+    
+    # Show a sample VLM enriched node
+    sample_vlm = next((n for n in nodes if "[VLM_SUMMARY]" in n.content), None)
+    if sample_vlm:
+        print(f"\n   Sample VLM Enrichment (Image Node):")
+        print(f"   Content: {sample_vlm.content[:150]}...")
+        if sample_vlm.node_meta.get("vlm_components"):
+            print(f"   Extracted Components: {sample_vlm.node_meta['vlm_components']}")
 
 def print_statistics(nodes, edges):
     print(f"\n📊 Total Statistics:")
@@ -139,18 +158,37 @@ def test_pipeline(pdf_path):
     print(f"   Status: {document.status}")
     print(f"   Pages: {document.total_pages}")
     
-    # 2. Initialize and Run Post-Processor
+    # 2. Initialize and Run Post-Processor (Phase 0.75)
     print("\n🛠️ Running GraphPostProcessor...")
     post_processor = GraphPostProcessor()
     document, nodes, edges = post_processor.process(document, nodes, edges)
     print("✅ Post-Processing Complete.")
     
+    # 3. Initialize and Run Contextual Enricher (Phase 2)
+    print("\n🧠 Running ContextualEnricher (VLM/SLM)...")
+    
+    # --- CONFIGURATION ---
+    # By default, this points to local Ollama (http://localhost:11434/v1).
+    # To use OpenAI: ContextualEnricher(llm_base_url="https://api.openai.com/v1", llm_api_key="sk-...", slm_model="gpt-4o-mini", vlm_model="gpt-4o-mini")
+    # To use Gemini: ContextualEnricher(llm_base_url="https://generativelanguage.googleapis.com/v1beta/openai/", llm_api_key="AI...", slm_model="gemini-1.5-flash", vlm_model="gemini-1.5-flash")
+    enricher = ContextualEnricher(
+        llm_base_url="https://api.groq.com/openai/v1",
+        llm_api_key=os.getenv("GROQ_API_KEY"),
+        slm_model="openai/gpt-oss-20b",
+        vlm_model="meta-llama/llama-4-scout-17b-16e-instruct",
+    )
+
+    
+    document, nodes, edges = enricher.process(document, nodes, edges)
+    print("✅ Contextual Enrichment Complete.")
+    
     # Build maps for printing
     node_map = build_node_map(nodes)
     
-    # 3. Print Stats and Verifications
+    # 4. Print Stats and Verifications
     print_statistics(nodes, edges)
     print_post_processing_stats(nodes, edges, node_map)
+    print_llm_enrichment_stats(nodes)  # New Phase 2 stats
     
     # Sample nodes
     print_sample_nodes(nodes, count=5)

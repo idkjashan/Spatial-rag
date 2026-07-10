@@ -1,12 +1,15 @@
 import os
 import re
 import uuid
+import logging
 import importlib.metadata
 from typing import Dict, Tuple, List, Optional, Any
 
 from core.models.node import Node, ModalityCategory, Granularity, BoundingBox
 from core.models.edge import Edge, EdgeCategory
 from core.models.document import Document, DocStatus
+
+logger = logging.getLogger(__name__)
 
 class DoclingMapper:
     LABEL_MAP = {
@@ -28,6 +31,9 @@ class DoclingMapper:
         "element_to_element":  ("contains", EdgeCategory.HIERARCHY),
         "element_to_caption":  ("captioned_by", EdgeCategory.CAPTION),
         "read_order":          ("read_order_next", EdgeCategory.READ_ORDER),
+        "table_to_row":        ("contains_row", EdgeCategory.TABLE_HIERARCHY),
+        "list_to_item":        ("contains_item", EdgeCategory.HIERARCHY),
+        "eq_to_latex":         ("contains_latex", EdgeCategory.HIERARCHY),
     }
 
     def __init__(self, doc_id: str, tenant_id: str, image_cache_path: str):
@@ -49,8 +55,8 @@ class DoclingMapper:
         self.heading_stack = []
         self.page_dims_map: Dict[int, Tuple[float, float, float]] = {}
         
-        # FIX: Track deferred captions to inject text after all nodes are processed
         self.deferred_captions: Dict[str, List[str]] = {}
+        self.current_list_id: Optional[str] = None
 
     def _safe_get_attr(self, obj: Any, attr_path: str, default: Any = None) -> Any:
         attrs = attr_path.split('.')
@@ -124,7 +130,6 @@ class DoclingMapper:
         return None
 
     def _extract_ref_number(self, text: str) -> Optional[str]:
-        # FIX: Updated regex to capture floats like 1.2
         match = re.search(r'(?:Figure|Fig\.|Table|Tab\.|Equation|Eq\.|Section|Sec\.)\s*(\d+(?:\.\d+)*)', text, re.IGNORECASE)
         return match.group(1) if match else None
 
@@ -208,9 +213,7 @@ class DoclingMapper:
                 elif item.label == "picture":
                     self._process_picture_item(item, page_nodes_map)
 
-        # FIX: Inject deferred captions now that all text nodes have been processed
         self._inject_deferred_captions()
-        
         self._generate_read_order_edges()
         return self.nodes, self.edges
 
@@ -253,6 +256,7 @@ class DoclingMapper:
         is_container = config.get("is_container", False)
         
         if is_container:
+            self.current_list_id = None 
             level = 1 if label == "title" else getattr(item, 'level', 2)
             edge_meta['level'] = level
             while self.heading_stack and self.heading_stack[-1][0] >= level:
@@ -264,25 +268,86 @@ class DoclingMapper:
             self._create_edge(parent_id, node_id, "heading_to_heading", edge_meta)
             
         elif label == "formula":
+            self.current_list_id = None
             parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
-            edge_meta['display_type'] = getattr(item, 'display_type', 'inline')
-            node_meta['latex'] = text_content
-            self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, None, "member", node_meta=node_meta)
-            self._create_edge(parent_id, node_id, "element_to_element", edge_meta)
+            
+            eq_id = self.get_or_create_id(item.self_ref)
+            self._create_node(item.self_ref, "equation", ModalityCategory.EQUATION, "Mathematical Equation", bbox, parent_id, eq_id, "container")
+            self._create_edge(parent_id, eq_id, "element_to_element", edge_meta)
+            
+            formula_ref = str(uuid.uuid4())
+            image_path = os.path.join(self.image_cache_path, f"{formula_ref}.png")
+            
+            # FIX: Robust Formula Image Extraction with Page Crop Fallback
+            try:
+                pil_image = None
+                if hasattr(item, 'get_image') and self.docling_doc:
+                    try:
+                        pil_image = item.get_image(doc=self.docling_doc)
+                    except Exception:
+                        pil_image = None
+                
+                # Fallback to cropping from page image
+                if not pil_image and bbox and self.docling_doc:
+                    page_no_int = bbox.page + 1
+                    page = self.docling_doc.pages.get(page_no_int)
+                    if page and hasattr(page, 'get_image'):
+                        page_img = page.get_image()
+                        if page_img:
+                            w, h = page_img.size
+                            left = int(bbox.x * w)
+                            top = int(bbox.y * h)
+                            right = int((bbox.x + bbox.w) * w)
+                            bottom = int((bbox.y + bbox.h) * h)
+                            pil_image = page_img.crop((left, top, right, bottom))
+                
+                if pil_image:
+                    pil_image.save(image_path)
+                else:
+                    image_path = None  # Ensure we don't store a broken path
+            except Exception as e:
+                logger.error(f"Failed to extract formula image: {e}")
+                image_path = None
+            
+            formula_node = self._create_node(
+                ref=formula_ref, 
+                fixed_id=formula_ref, 
+                modality="formula", 
+                mod_cat=ModalityCategory.FORMULA, 
+                content=text_content, 
+                bbox=bbox, 
+                parent_id=eq_id, 
+                subgraph_id=eq_id, 
+                subgraph_role="member", 
+                image_path=image_path, 
+                node_meta={"latex": text_content}
+            )
+            self._create_edge(eq_id, formula_node.id, "eq_to_latex")
             
         elif label == "list_item":
-            parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
+            if self.current_list_id is None:
+                list_ref = str(uuid.uuid4())
+                parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
+                list_node = self._create_node(list_ref, "list", ModalityCategory.DOCUMENT_STRUCTURE, "List Group", bbox, parent_id, None, "container")
+                list_node.subgraph_id = list_node.id
+                self.current_list_id = list_node.id
+                self._create_edge(parent_id, list_node.id, "element_to_element")
+            else:
+                parent_id = self.current_list_id
+                
             marker = getattr(item, 'marker', None)
             if marker: node_meta['marker'] = marker
-            self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, None, "member", node_meta=node_meta)
-            self._create_edge(parent_id, node_id, "element_to_element", edge_meta)
+            list_item_node = self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, self.current_list_id, "member", node_meta=node_meta)
+            self._create_edge(parent_id, list_item_node.id, "list_to_item", edge_meta)
             
         else:
+            self.current_list_id = None
             parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
             self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, None, "member", node_meta=node_meta)
             self._create_edge(parent_id, node_id, "element_to_element", edge_meta)
 
     def _process_table_item(self, item, page_nodes_map):
+        self.current_list_id = None
         bbox = self._extract_bbox(item)
         page_no = bbox.page + 1 if bbox else 1
         node_id = self.get_or_create_id(item.self_ref)
@@ -291,16 +356,51 @@ class DoclingMapper:
         content = item.export_to_markdown() if hasattr(item, 'export_to_markdown') else str(item)
         self._create_node(item.self_ref, "table", ModalityCategory.TABLE_CONTAINER, content, bbox, parent_id, node_id, "container")
         self._create_edge(parent_id, node_id, "element_to_element")
+        
+        self._deconstruct_table(content, node_id)
         self._link_captions(item, node_id, "table")
 
+    def _deconstruct_table(self, markdown_content: str, container_id: str):
+        lines = [l.strip() for l in markdown_content.strip().split('\n') if l.strip()]
+        if len(lines) < 2: return
+            
+        headers = [h.strip() for h in lines[0].split('|') if h.strip()]
+        if not headers: return
+        
+        data_lines = lines[2:] if re.match(r'^\s*\|?[\s:-]+\|[\s:\-]+\|?\s*$', lines[1]) else lines[1:]
+        
+        row_idx = 0
+        for line in data_lines:
+            if not line.startswith('|'): continue
+            vals = [v.strip() for v in line.split('|') if v.strip() != '']
+            if not vals: continue
+            
+            row_meta = {"row_index": row_idx}
+            for i, val in enumerate(vals):
+                col_name = headers[i] if i < len(headers) else f"col_{i}"
+                row_meta[col_name] = val
+                
+            row_content = " | ".join(vals)
+            row_ref = str(uuid.uuid4())
+            
+            row_node = self._create_node(
+                ref=row_ref, fixed_id=row_ref, 
+                modality="table_row", mod_cat=ModalityCategory.TABLE_CONTENT, 
+                content=row_content, bbox=None, 
+                parent_id=container_id, subgraph_id=container_id, subgraph_role="member", 
+                node_meta=row_meta
+            )
+            self._create_edge(container_id, row_node.id, "table_to_row", {"row_index": row_idx})
+            row_idx += 1
+
     def _process_picture_item(self, item, page_nodes_map):
+        self.current_list_id = None
         bbox = self._extract_bbox(item)
         page_no = bbox.page + 1 if bbox else 1
         node_id = self.get_or_create_id(item.self_ref)
         parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
         
         image_path = os.path.join(self.image_cache_path, f"{node_id}.png")
-        # Give image a default content so it's not strictly empty if no caption exists
         node = self._create_node(item.self_ref, "figure", ModalityCategory.IMAGE, "Figure image.", bbox, parent_id, None, "member", image_path)
         self.image_ref_map[item.self_ref] = node
         self._create_edge(parent_id, node_id, "element_to_element")
@@ -317,10 +417,7 @@ class DoclingMapper:
         captions = getattr(item, 'captions', [])
         for cap_ref in captions:
             cap_ref_str = self._get_ref_string(cap_ref)
-            # FIX: Pre-allocate ID so the edge can be created immediately,
-            # even if the caption text node hasn't been processed yet.
             cap_node_id = self.get_or_create_id(cap_ref_str)
-            
             self._create_edge(source_node_id, cap_node_id, "element_to_caption", {"ref_type": ref_type})
             
             if source_node_id not in self.deferred_captions:
@@ -328,7 +425,6 @@ class DoclingMapper:
             self.deferred_captions[source_node_id].append(cap_node_id)
 
     def _inject_deferred_captions(self):
-        """Injects caption text and reference numbers into image/table nodes after all nodes exist."""
         for source_id, cap_ids in self.deferred_captions.items():
             source_node = next((n for n in self.nodes if n.id == source_id), None)
             if not source_node: continue
@@ -336,12 +432,10 @@ class DoclingMapper:
             for cap_id in cap_ids:
                 cap_text = self.node_text_map.get(cap_id, "")
                 if cap_text:
-                    # Inject into source content
                     if "[CAPTION]:" not in source_node.content:
                         source_node.content += f"\n\n[CAPTION]: {cap_text}"
                         self.node_text_map[source_id] = source_node.content
                     
-                    # Update edge meta with number
                     ref_num = self._extract_ref_number(cap_text)
                     if ref_num:
                         for e in self.edges:
@@ -350,11 +444,8 @@ class DoclingMapper:
                                 break
 
     def _generate_read_order_edges(self):
-        allowed_categories = [
-            ModalityCategory.TEXTUAL_CONTENT, ModalityCategory.FORMULA,
-            ModalityCategory.TABLE_CONTAINER, ModalityCategory.IMAGE
-        ]
-        narrative_nodes = [n for n in self.nodes if n.modality_category in allowed_categories]
+        narrative_modalities = ["paragraph", "table", "figure", "equation", "list"]
+        narrative_nodes = [n for n in self.nodes if n.modality in narrative_modalities]
         sorted_nodes = sorted(narrative_nodes, key=lambda n: n.sequence_index)
         
         for i in range(len(sorted_nodes) - 1):

@@ -24,7 +24,7 @@ class DoclingParser(BaseParser):
         pipeline_options = PdfPipelineOptions(
             do_ocr=False, 
             do_table_structure=True,
-            generate_page_images=False,
+            generate_page_images=True,  # FIX: Required to crop formula images
             generate_picture_images=True
         )
         
@@ -37,22 +37,17 @@ class DoclingParser(BaseParser):
     def _extract_image_from_picture(self, pic_item, docling_doc, save_path: str) -> bool:
         """Robustly extracts image from a Docling PictureItem."""
         try:
-            # In Docling v2, picture.image is an ImageRef. We need to get the actual PIL Image.
             if hasattr(pic_item, 'get_image'):
-                # get_image returns a PIL Image.Image object
                 image = pic_item.get_image(doc=docling_doc)
                 if image:
                     image.save(save_path)
                     return True
                     
-            # Fallback for older/special versions
             elif hasattr(pic_item, 'image') and pic_item.image:
                 img_ref = pic_item.image
-                # If it's already a PIL Image
                 if hasattr(img_ref, 'save'):
                     img_ref.save(save_path)
                     return True
-                # If it's an ImageRef with a URI
                 elif hasattr(img_ref, 'uri') and img_ref.uri:
                     from PIL import Image
                     img = Image.open(str(img_ref.uri))
@@ -90,10 +85,34 @@ class DoclingParser(BaseParser):
                     except Exception as e:
                         document.log(f"Failed to extract image for node {node.id}: {str(e)}")
         
+        # FIX: Crop Formula Images from Page Images
+        if hasattr(docling_doc, 'pages'):
+            for node in nodes:
+                # Look for child formula nodes that have a bbox but no image path yet
+                if node.modality == "formula" and node.bbox and not node.image_path:
+                    page_no = node.bbox.page + 1
+                    page = docling_doc.pages.get(page_no)
+                    if page and hasattr(page, 'get_image'):
+                        try:
+                            page_img = page.get_image()
+                            if page_img:
+                                w, h = page_img.size
+                                left = int(node.bbox.x * w)
+                                top = int(node.bbox.y * h)
+                                right = int((node.bbox.x + node.bbox.w) * w)
+                                bottom = int((node.bbox.y + node.bbox.h) * h)
+                                
+                                # Crop and save
+                                formula_img = page_img.crop((left, top, right, bottom))
+                                img_path = os.path.join(self.image_cache_path, f"{node.id}.png")
+                                formula_img.save(img_path)
+                                node.image_path = img_path
+                        except Exception as e:
+                            document.log(f"Failed to crop formula image for node {node.id}: {str(e)}")
+        
         # Update document counts
         document.node_count = len(nodes)
         document.edge_count = len(edges)
-        # Calculate number of subgraphs (containers)
         document.subgraph_count = sum(1 for n in nodes if n.subgraph_role == "container")
         
         document.status = DocStatus.READY

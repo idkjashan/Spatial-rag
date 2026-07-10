@@ -9,3 +9,5 @@ asyncpg==0.29.0
 python-dotenv==1.0.1
 docling==2.109.0
 shapely
+openai
+tenacity
