@@ -6,11 +6,13 @@ from dotenv import load_dotenv
 load_dotenv()
 from collections import defaultdict
 from typing import List, Tuple, Dict
+from core.config import EngineConfig
 
 from core.parsers.docling_parser import DoclingParser
 from core.processors.post_processor import GraphPostProcessor
 from core.processors.contextual_enricher import ContextualEnricher
-from core.embeddings.graph_embedder import GraphEmbedder  # FIXED: Updated import path
+from core.embeddings.graph_embedder import GraphEmbedder
+from core.stores.storage_manager import StorageManager
 from core.models.node import Node, ModalityCategory
 from core.models.edge import Edge, EdgeCategory
 from core.models.document import Document
@@ -26,6 +28,15 @@ except ImportError:
     RICH_AVAILABLE = False
 
 STATE_FILE = "enriched_output_full.json"
+
+# ==========================================
+# Database UI Links
+# ==========================================
+def print_db_links(config: EngineConfig):
+    print("\n🔗 Database UI Links (Make sure Docker containers are running):")
+    print(f"   🐘 Postgres DSN: {config.db.postgres_dsn}")
+    print(f"   🕸️ Neo4j Browser: {config.db.neo4j_url.replace('bolt', 'http').replace('7687', '7474')} (user: {config.db.neo4j_user}, pass: {config.db.neo4j_password})")
+    print(f"   🧲 Qdrant Dashboard: {config.db.qdrant_url}/dashboard")
 
 # ==========================================
 # State Management (Save/Load)
@@ -80,12 +91,14 @@ def get_user_selection():
     print("2. Post-Process (Spatial, Hierarchy, Context)")
     print("3. LLM Enrichment (VLM/SLM Summaries)")
     print("4. Graph Embedding (Dense Vectors)")
-    print("Type 'all' to run 1 -> 2 -> 3 -> 4 sequentially.")
+    print("5. Storage (Postgres, Neo4j, Qdrant)")
+    print("6. Verify Storage (Read from DBs)")  # NEW
+    print("Type 'all' to run 1 -> 2 -> 3 -> 4 -> 5 sequentially.")
     
-    selection = input("Enter steps to run (e.g., '1,2' or '3' or 'all'): ").strip().lower()
+    selection = input("Enter steps to run (e.g., '1,2' or '6' or 'all'): ").strip().lower()
     
     if selection == 'all':
-        return ['1', '2', '3', '4']
+        return ['1', '2', '3', '4', '5']
     return [s.strip() for s in selection.split(',') if s.strip()]
 
 # ==========================================
@@ -181,12 +194,58 @@ def print_embedding_stats(nodes: List[Node], edges: List[Edge], node_vectors: Di
     nodes_with_vecs = sum(1 for n in nodes if n.node_meta.get("__embedding_vector__"))
     print(f"   Nodes with attached vector meta: {nodes_with_vecs}")
 
+def verify_storage(config: EngineConfig):
+    """Connects directly to the 3 databases using EngineConfig to count records and verify writes."""
+    print("\n🔍 Verifying Database Storage...")
+    
+    # 1. Postgres Verification
+    try:
+        import psycopg2
+        pg_conn = psycopg2.connect(config.db.postgres_dsn)
+        with pg_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM documents;")
+            doc_count = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM nodes;")
+            node_count = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM edges;")
+            edge_count = cur.fetchone()[0]
+        pg_conn.close()
+        print(f"   🐘 Postgres: {doc_count} Docs, {node_count} Nodes, {edge_count} Edges")
+    except Exception as e:
+        print(f"   ❌ Postgres Verification Failed: {e}")
+
+    # 2. Neo4j Verification
+    try:
+        from neo4j import GraphDatabase
+        driver = GraphDatabase.driver(config.db.neo4j_url, auth=(config.db.neo4j_user, config.db.neo4j_password))
+        with driver.session() as session:
+            node_res = session.run("MATCH (n) RETURN COUNT(n) as count").single()
+            edge_res = session.run("MATCH ()-[r]->() RETURN COUNT(r) as count").single()
+            print(f"   🕸️ Neo4j: {node_res['count']} Nodes, {edge_res['count']} Edges")
+        driver.close()
+    except Exception as e:
+        print(f"   ❌ Neo4j Verification Failed: {e}")
+
+    # 3. Qdrant Verification
+    try:
+        from qdrant_client import QdrantClient
+        qdrant = QdrantClient(url=config.db.qdrant_url, api_key=config.db.qdrant_api_key)
+        node_vecs = qdrant.count(collection_name="nodes").count
+        edge_vecs = qdrant.count(collection_name="edges").count
+        print(f"   🧲 Qdrant: {node_vecs} Node Vectors, {edge_vecs} Edge Vectors")
+    except Exception as e:
+        print(f"   ❌ Qdrant Verification Failed: {e}")
+
 # ==========================================
 # Main Pipeline Execution
 # ==========================================
 
 def run_pipeline(pdf_path: str, steps: List[str]):
     document, nodes, edges = None, None, None
+    node_vectors, edge_vectors = {}, {} # Keep track of vectors if generated
+    storage = None  # Initialize storage as None so we can safely close it later if it was used
+    
+    engine_config = EngineConfig()
     
     # STEP 1: Parse PDF
     if '1' in steps:
@@ -195,7 +254,8 @@ def run_pipeline(pdf_path: str, steps: List[str]):
         document, nodes, edges = parser.parse(pdf_path)
         save_state(document, nodes, edges)
     else:
-        document, nodes, edges = load_state()
+        if document is None:
+            document, nodes, edges = load_state()
         
     # STEP 2: Post-Process
     if '2' in steps:
@@ -237,11 +297,38 @@ def run_pipeline(pdf_path: str, steps: List[str]):
         save_state(document, nodes, edges)
         print_embedding_stats(nodes, edges, node_vectors, edge_vectors)
 
+    # STEP 5: Storage
+    if '5' in steps:
+        print("\n🗄️ Step 5: Running StorageManager (Postgres, Neo4j, Qdrant)...")
+        
+        reset_choice = input("⚠️ Do you want to WIPE all databases before saving? (y/n): ").strip().lower()
+        
+        # Initialize Storage 
+        storage = StorageManager(config=engine_config) 
+        
+        if reset_choice == 'y':
+            storage.reset_database()
+            
+        storage.save(document, nodes, edges)
+        print("✅ Storage Pipeline Complete.")
+
+    # STEP 6: Verify Storage
+    if '6' in steps:
+        verify_storage(engine_config)
+
     # Final Summary Print
-    print_statistics(nodes, edges)
-    print_hierarchy(nodes, edges, document.id)
+    if document and nodes and edges:
+        print_statistics(nodes, edges)
+        print_hierarchy(nodes, edges, document.id)
+        
+    # Safely close storage connection if it was opened
+    if storage:
+        storage.close()
 
 if __name__ == "__main__":
+    engine_config = EngineConfig()
+    print_db_links(engine_config)
+    
     pdf_file = "./CRNN.pdf"
     if not os.path.exists(pdf_file):
         print(f"❌ PDF not found at {pdf_file}")

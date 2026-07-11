@@ -42,9 +42,11 @@ class DoclingMapper:
         self.image_cache_path = image_cache_path
         self.docling_doc = None
         
-        try: self.processor_version = importlib.metadata.version("docling")
-        except: self.processor_version = "unknown"
-        
+        try: 
+            self.processor_version = importlib.metadata.version("docling")
+        except Exception: 
+            self.processor_version = "unknown"
+            
         self.id_map: Dict[str, str] = {}
         self.image_ref_map: Dict[str, Node] = {} 
         self.node_text_map: Dict[str, str] = {} 
@@ -57,6 +59,7 @@ class DoclingMapper:
         
         self.deferred_captions: Dict[str, List[str]] = {}
         self.current_list_id: Optional[str] = None
+        logger.info(f"DoclingMapper initialized for doc_id: {doc_id}")
 
     def _safe_get_attr(self, obj: Any, attr_path: str, default: Any = None) -> Any:
         attrs = attr_path.split('.')
@@ -161,7 +164,8 @@ class DoclingMapper:
     def _create_node(self, ref, modality: str, mod_cat: ModalityCategory, content: str, 
                      bbox: Optional[BoundingBox], parent_id: str, subgraph_id: Optional[str], 
                      subgraph_role: str = "member", image_path: Optional[str] = None, 
-                     fixed_id: Optional[str] = None, node_meta: Optional[Dict] = None) -> Node:
+                     fixed_id: Optional[str] = None, node_meta: Optional[Dict] = None,
+                     granularity: Granularity = Granularity.ELEMENT) -> Node:
         self.seq_idx += 1
         ref_str = self._get_ref_string(ref)
         
@@ -177,12 +181,13 @@ class DoclingMapper:
         node = Node(
             id=node_id, tenant_id=self.tenant_id, doc_id=self.doc_id, parent_id=parent_id,
             modality=modality, modality_category=mod_cat, content=content, bbox=bbox,
-            granularity=Granularity.ELEMENT, sequence_index=self.seq_idx,
+            granularity=granularity, sequence_index=self.seq_idx,
             subgraph_id=subgraph_id, subgraph_role=subgraph_role, image_path=image_path,
             node_meta=node_meta or {}, processor_name="docling", processor_version=self.processor_version
         )
         self.nodes.append(node)
         self.node_text_map[node_id] = content
+        logger.debug(f"Created Node: {modality} ({granularity.value}) - ID: {node_id}")
         return node
 
     def _create_edge(self, source_id: str, target_id: str, edge_key: str, edge_meta: Optional[Dict] = None):
@@ -195,6 +200,7 @@ class DoclingMapper:
 
     def map_document(self, docling_doc, source_path: str) -> Document:
         total_pages = len(docling_doc.pages) if hasattr(docling_doc, 'pages') else 0
+        logger.info(f"Mapping document with {total_pages} pages.")
         return Document(
             id=self.doc_id, tenant_id=self.tenant_id, source_path=source_path, plugin="docling",
             total_pages=total_pages, status=DocStatus.INDEXING, processor_name="docling", processor_version=self.processor_version
@@ -215,6 +221,7 @@ class DoclingMapper:
 
         self._inject_deferred_captions()
         self._generate_read_order_edges()
+        logger.info(f"Mapping complete. Total Nodes: {len(self.nodes)}, Total Edges: {len(self.edges)}")
         return self.nodes, self.edges
 
     def _process_pages(self, docling_doc) -> Dict[int, Node]:
@@ -237,7 +244,8 @@ class DoclingMapper:
                     content=f"Page {page_no}", 
                     bbox=BoundingBox(x=0.0, y=0.0, w=1.0, h=1.0, page=page_no-1, confidence=1.0, dpi=dpi),
                     parent_id=self.doc_id, subgraph_id=None, subgraph_role="container", 
-                    node_meta={"width": w, "height": h, "dpi": dpi}
+                    node_meta={"width": w, "height": h, "dpi": dpi},
+                    granularity=Granularity.PAGE
                 )
                 page_nodes_map[page_no] = page_node
                 self._create_edge(self.doc_id, page_node.id, "doc_to_page", edge_meta={"width": w, "height": h, "dpi": dpi})
@@ -264,7 +272,7 @@ class DoclingMapper:
             
             parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
             self.heading_stack.append((level, node_id, None))
-            self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, None, "container", node_meta=node_meta)
+            self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, None, "container", node_meta=node_meta, granularity=Granularity.SECTION)
             self._create_edge(parent_id, node_id, "heading_to_heading", edge_meta)
             
         elif label == "formula":
@@ -272,22 +280,21 @@ class DoclingMapper:
             parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
             
             eq_id = self.get_or_create_id(item.self_ref)
-            self._create_node(item.self_ref, "equation", ModalityCategory.EQUATION, "Mathematical Equation", bbox, parent_id, eq_id, "container")
+            self._create_node(item.self_ref, "equation", ModalityCategory.EQUATION, "Mathematical Equation", bbox, parent_id, eq_id, "container", granularity=Granularity.BLOCK)
             self._create_edge(parent_id, eq_id, "element_to_element", edge_meta)
             
             formula_ref = str(uuid.uuid4())
             image_path = os.path.join(self.image_cache_path, f"{formula_ref}.png")
             
-            # FIX: Robust Formula Image Extraction with Page Crop Fallback
             try:
                 pil_image = None
                 if hasattr(item, 'get_image') and self.docling_doc:
                     try:
                         pil_image = item.get_image(doc=self.docling_doc)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Direct image extraction failed for formula, falling back to crop: {e}")
                         pil_image = None
                 
-                # Fallback to cropping from page image
                 if not pil_image and bbox and self.docling_doc:
                     page_no_int = bbox.page + 1
                     page = self.docling_doc.pages.get(page_no_int)
@@ -304,23 +311,16 @@ class DoclingMapper:
                 if pil_image:
                     pil_image.save(image_path)
                 else:
-                    image_path = None  # Ensure we don't store a broken path
+                    image_path = None 
             except Exception as e:
                 logger.error(f"Failed to extract formula image: {e}")
                 image_path = None
             
             formula_node = self._create_node(
-                ref=formula_ref, 
-                fixed_id=formula_ref, 
-                modality="formula", 
-                mod_cat=ModalityCategory.FORMULA, 
-                content=text_content, 
-                bbox=bbox, 
-                parent_id=eq_id, 
-                subgraph_id=eq_id, 
-                subgraph_role="member", 
-                image_path=image_path, 
-                node_meta={"latex": text_content}
+                ref=formula_ref, fixed_id=formula_ref, modality="formula", mod_cat=ModalityCategory.FORMULA, 
+                content=text_content, bbox=bbox, parent_id=eq_id, subgraph_id=eq_id, subgraph_role="member", 
+                image_path=image_path, node_meta={"latex": text_content},
+                granularity=Granularity.ELEMENT
             )
             self._create_edge(eq_id, formula_node.id, "eq_to_latex")
             
@@ -328,7 +328,7 @@ class DoclingMapper:
             if self.current_list_id is None:
                 list_ref = str(uuid.uuid4())
                 parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
-                list_node = self._create_node(list_ref, "list", ModalityCategory.DOCUMENT_STRUCTURE, "List Group", bbox, parent_id, None, "container")
+                list_node = self._create_node(list_ref, "list", ModalityCategory.DOCUMENT_STRUCTURE, "List Group", bbox, parent_id, None, "container", granularity=Granularity.BLOCK)
                 list_node.subgraph_id = list_node.id
                 self.current_list_id = list_node.id
                 self._create_edge(parent_id, list_node.id, "element_to_element")
@@ -337,13 +337,14 @@ class DoclingMapper:
                 
             marker = getattr(item, 'marker', None)
             if marker: node_meta['marker'] = marker
-            list_item_node = self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, self.current_list_id, "member", node_meta=node_meta)
+            list_item_node = self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, self.current_list_id, "member", node_meta=node_meta, granularity=Granularity.ELEMENT)
             self._create_edge(parent_id, list_item_node.id, "list_to_item", edge_meta)
             
         else:
             self.current_list_id = None
             parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
-            self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, None, "member", node_meta=node_meta)
+            gran = Granularity.ELEMENT if label == "caption" else Granularity.BLOCK
+            self._create_node(item.self_ref, config["modality"], config["category"], text_content, bbox, parent_id, None, "member", node_meta=node_meta, granularity=gran)
             self._create_edge(parent_id, node_id, "element_to_element", edge_meta)
 
     def _process_table_item(self, item, page_nodes_map):
@@ -354,7 +355,7 @@ class DoclingMapper:
         parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
         
         content = item.export_to_markdown() if hasattr(item, 'export_to_markdown') else str(item)
-        self._create_node(item.self_ref, "table", ModalityCategory.TABLE_CONTAINER, content, bbox, parent_id, node_id, "container")
+        self._create_node(item.self_ref, "table", ModalityCategory.TABLE_CONTAINER, content, bbox, parent_id, node_id, "container", granularity=Granularity.BLOCK)
         self._create_edge(parent_id, node_id, "element_to_element")
         
         self._deconstruct_table(content, node_id)
@@ -388,7 +389,8 @@ class DoclingMapper:
                 modality="table_row", mod_cat=ModalityCategory.TABLE_CONTENT, 
                 content=row_content, bbox=None, 
                 parent_id=container_id, subgraph_id=container_id, subgraph_role="member", 
-                node_meta=row_meta
+                node_meta=row_meta,
+                granularity=Granularity.ELEMENT
             )
             self._create_edge(container_id, row_node.id, "table_to_row", {"row_index": row_idx})
             row_idx += 1
@@ -401,7 +403,7 @@ class DoclingMapper:
         parent_id = self._get_hierarchy_parent(page_no, page_nodes_map)
         
         image_path = os.path.join(self.image_cache_path, f"{node_id}.png")
-        node = self._create_node(item.self_ref, "figure", ModalityCategory.IMAGE, "Figure image.", bbox, parent_id, None, "member", image_path)
+        node = self._create_node(item.self_ref, "figure", ModalityCategory.IMAGE, "Figure image.", bbox, parent_id, None, "member", image_path, granularity=Granularity.BLOCK)
         self.image_ref_map[item.self_ref] = node
         self._create_edge(parent_id, node_id, "element_to_element")
         
@@ -409,7 +411,8 @@ class DoclingMapper:
             if hasattr(item, 'get_image') and self.docling_doc:
                 pil_image = item.get_image(doc=self.docling_doc)
                 if pil_image: pil_image.save(image_path)
-        except: pass
+        except Exception as e:
+            logger.debug(f"Could not extract/save image for node {node_id}: {e}")
         
         self._link_captions(item, node_id, "figure")
 
