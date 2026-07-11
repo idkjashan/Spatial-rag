@@ -1,9 +1,13 @@
 # core/pipeline.py
-from core.stores.transaction import StorageTransaction
+import logging
+from core.stores.manager import StorageManager
 from core.models.document import Document, DocStatus
 from core.models.processor import ProcessorManifest, ProcessorCapability
+from core.embeddings.graph_embedder import EmbeddingService
 from core.config import EngineConfig
-from core.stores.interfaces import MetaStoreInterface, GraphStoreInterface, VectorStoreInterface
+
+logger = logging.getLogger(__name__)
+
 
 # ---- Placeholder functions ----
 def docling_parse(file_path):
@@ -41,65 +45,26 @@ class VLMProcessor:
         return [], []
 
 # ---- Main pipeline ----
-def index_document(
-    raw_file_path: str,
-    config: EngineConfig,
-    meta: MetaStoreInterface,
-    graph: GraphStoreInterface,
-    vector: VectorStoreInterface,
-    embedder,  # injected embedder with .embed_text() and .embed_image(path)
+async def index_document(
+    doc: Document,
+    nodes: list,
+    edges: list,
+    storage_manager: StorageManager,
+    tenant_id: str
 ) -> str:
-    docling_output = docling_parse(raw_file_path)
+    """
+    Index a document by staging nodes and edges and committing them.
+    """
+    try:
+        await storage_manager.begin_transaction(tenant_id)
+        for node in nodes:
+            storage_manager.stage_node(node)
+        for edge in edges:
+            storage_manager.stage_edge(edge)
 
-    doc = Document(
-        source_path=raw_file_path,
-        plugin="docling_v1",
-        tenant_id=config.tenant_id
-    )
-    manifest = ProcessorManifest(
-        processor_name="docling_v2",
-        version="1.0.0",
-        capability=ProcessorCapability.TEXT_PARSER,
-        inputs_required=["pdf_file"],
-        outputs_produced=["parsed_elements"]
-    )
-
-    tx = StorageTransaction(meta, graph, vector, tenant_id=config.tenant_id)
-    with tx:
-        doc_id = tx.begin(doc, manifest)
-        all_nodes = []
-        all_edges = []
-
-        for entity in docling_output:
-            if entity.type == "text":
-                nodes, edges = TextProcessor.process(entity, config)
-            elif entity.type == "table":
-                nodes, edges = TableProcessor.process(entity, config)
-            elif entity.type == "figure" and is_complex_diagram(entity):
-                nodes, edges = DiagramProcessor.process(entity, config)
-            elif entity.type == "figure":
-                nodes, edges = VLMProcessor.process(entity, config)
-            else:
-                continue
-            all_nodes.extend(nodes)
-            all_edges.extend(edges)
-
-        tx.commit_nodes_and_edges(all_nodes, all_edges)
-
-        vectors = []
-        for node in all_nodes:
-            # text embedding
-            vec_text = embedder.embed_text(node.content)
-            vectors.append((node.id, vec_text, {"model": "bge_m3", "type": "text"}))
-
-            # visual embedding if image_path exists
-            if node.image_path:
-                vec_vis = embedder.embed_image(node.image_path)
-                vis_id = f"{node.id}_clip"
-                vectors.append((vis_id, vec_vis, {"model": "clip_vit", "type": "visual"}))
-                node.embedding_refs["clip_vit_v1"] = vis_id
-
-        tx.commit_embeddings(vectors)
-        tx.finalize(DocStatus.READY.value)
-
-        return doc_id
+        counts = await storage_manager.commit_transaction(tenant_id)
+        logger.info(f"Indexed {counts['nodes']} nodes and {counts['edges']} edges for doc {doc.id}")
+        return doc.id
+    except Exception as e:
+        logger.error(f"Indexing failed for {doc.id}: {e}")
+        raise
