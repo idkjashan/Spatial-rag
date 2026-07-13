@@ -3,6 +3,4 @@
 __pycache__/
 *.log
 images_cache/
-CRNN.pdf
-all_pages.png
-enriched_output_full.json
+
